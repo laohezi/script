@@ -137,6 +137,17 @@ source $ZSH/oh-my-zsh.sh
 ZSH_AUTOSUGGEST_HIGHLIGHT_STYLE="fg=#888888"
 bindkey '^[[A' history-substring-search-up
 bindkey '^[[B' history-substring-search-down
+bindkey "$terminfo[kcuu1]" history-substring-search-up
+bindkey "$terminfo[kcud1]" history-substring-search-down
+
+
+# Proxy aliases
+alias proxy="export all_proxy=http://127.0.0.1:7890"
+alias proxy_remote='export all_proxy=http://192.168.3.92:7890'
+alias unproxy="unset all_proxy"
+alias git_proxy="git config --global http.proxy http://127.0.0.1:7890 && git config --global https.proxy https://127.0.0.1:7890"
+alias git_unproxy="git config --global --unset http.proxy && git config --global --unset https.proxy"
+alias git_config="git config --global user.name laohezi && git config --global user.email 619322854@qq.com"
 """
 
     # Preserve custom configurations from backup
