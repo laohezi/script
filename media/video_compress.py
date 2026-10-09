@@ -28,7 +28,7 @@ HARDWARE_ENCODERS = (
     ("hevc_vaapi", "-qp"),
     ("hevc_videotoolbox", "-q:v"),
     ("hevc_nvenc", "-cq"),
-    ("hevc_amf", "-qp"),
+    ("hevc_amf", None),
 )
 
 
@@ -136,13 +136,13 @@ def check_hardware_encoder(ffmpeg_cmd):
         for encoder, quality_param in HARDWARE_ENCODERS:
             if encoder not in encoders:
                 continue
-            # qsv 可能列在支持列表中但实际不可用，用空跑验证
-            if encoder == "hevc_qsv":
-                test = [ffmpeg_cmd, "-hide_banner", "-f", "lavfi", "-i", "testsrc",
-                        "-c:v", encoder, "-f", "null", "-"]
-                if subprocess.run(test, stdout=subprocess.DEVNULL,
-                                  stderr=subprocess.DEVNULL).returncode != 0:
-                    continue
+            # 编码器列在支持列表中不代表本机可用（如 Windows 上的 vaapi/nvenc），用空跑验证
+            test = [ffmpeg_cmd, "-hide_banner", "-f", "lavfi",
+                    "-i", "testsrc=size=320x240:rate=25", "-t", "0.2",
+                    "-c:v", encoder, "-f", "null", "-"]
+            if subprocess.run(test, stdout=subprocess.DEVNULL,
+                              stderr=subprocess.DEVNULL).returncode != 0:
+                continue
             return encoder, quality_param
     except Exception as e:
         logI(f"检查硬件编码器失败: {e}")
@@ -157,13 +157,17 @@ def quality_args(encoder, quality_param, crf):
     if encoder == "hevc_videotoolbox":
         # videotoolbox 的 -q:v 取值 0-100 且越大越好，与 CRF 方向相反
         return ["-q:v", str(max(1, min(100, round(100 - crf * 100 / 51))))]
+    if encoder == "hevc_amf":
+        # AMF 没有 -qp 选项，需用 CQP 模式分别设置 I/P 帧 QP
+        return ["-rc", "cqp", "-qp_i", str(crf), "-qp_p", str(crf)]
     return [quality_param, str(crf)]
 
 
 def build_command(ffmpeg_cmd, task, encoder, quality_param, size):
     """构建 ffmpeg 命令"""
     cmd = [ffmpeg_cmd, "-i", str(task.video), "-c:v", encoder, "-tag:v", "hvc1"]
-    if task.options.preset:
+    # -preset 是 x265 的字符串预设，硬件编码器不适用（AMF 的 -preset 为整数）
+    if task.options.preset and encoder == SOFTWARE_ENCODER:
         cmd.extend(["-preset", task.options.preset])
     if size:
         cmd.extend(["-vf", f"scale={size[0]}:{size[1]}"])
