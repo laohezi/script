@@ -39,12 +39,17 @@ def calc_save_space(input_file, output_file):
     original_size = input_file.stat().st_size
     output_size = output_file.stat().st_size
     saved_space = original_size - output_size
-    formatted_text = f"({input_file.name}  {format_size(original_size)} -> {format_size(output_size)}) 节省 {format_size(saved_space)}"
+    saved_ratio = saved_space / original_size * 100 if original_size else 0.0
+    formatted_text = (
+        f"({input_file.name}  {format_size(original_size)} -> "
+        f"{format_size(output_size)}) 节省 {format_size(saved_space)} ({saved_ratio:.1f}%)"
+    )
     stats = {
         'origin_file': input_file,
         'original_size': original_size,
         'processed_size': output_size,
         'saved_size': saved_space,
+        'saved_ratio': saved_ratio,
         'formatted_text': formatted_text       
     }
     
@@ -359,7 +364,7 @@ class MediaProcessor:
                 logI(f"处理后总大小: {format_size(self.stats['processed_size'])}")
                 saved = self.stats['original_size'] - self.stats['processed_size']
                 saved_percentage = (saved / self.stats['original_size'] * 100) if self.stats['original_size'] > 0 else 0
-                logI(f"节省空间: {format_size(saved)} ({saved_percentage:.1f}%)")
+                logI(f"共节省: {format_size(saved)} ({saved_percentage:.1f}%)")
         
         return True
 

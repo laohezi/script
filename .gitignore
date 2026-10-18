@@ -54,3 +54,9 @@ coverage/
 
 
 media/__pycache__/
+
+# 菜单 helper 生成物（由 win/add_video_compress_context_menu.py 生成）
+.video_compress_crf_helper.py
+
+# 本地验证产物
+.verify_out/

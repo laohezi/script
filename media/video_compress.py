@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 
 import argparse
+import atexit
 import os
 import re
 import shutil
@@ -16,7 +17,7 @@ parent_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), os.pardir))
 sys.path.append(parent_dir)
 from utils.logger import setup_logging, logI
 from media_process import (
-    MediaProcessor, GlobalProgressTracker, calc_save_space
+    MediaProcessor, GlobalProgressTracker, calc_save_space, format_size
 )
 
 DEFAULT_CRF = 28
@@ -24,12 +25,40 @@ SOFTWARE_ENCODER = "libx265"
 SUPPORTED_FORMATS = (".mp4", ".mov", ".avi", ".mkv", ".webm", ".flv", ".m4v")
 # 硬件编码器优先级: qsv > vaapi > videotoolbox > nvenc > amf
 HARDWARE_ENCODERS = (
-    ("hevc_qsv", "-global_quality"),
-    ("hevc_vaapi", "-qp"),
-    ("hevc_videotoolbox", "-q:v"),
-    ("hevc_nvenc", "-cq"),
-    ("hevc_amf", None),
+    "hevc_qsv",
+    "hevc_vaapi",
+    "hevc_videotoolbox",
+    "hevc_nvenc",
+    "hevc_amf",
 )
+
+# x265 风格预设 -> 各硬件编码器原生预设
+# nvenc: p1 最快 / p7 最慢；qsv: veryfast..veryslow；amf: speed/balanced/quality/high_quality
+PRESET_CHOICES = ("ultrafast", "fast", "medium", "slow", "veryslow")
+DEFAULT_PRESET = "medium"
+PRESET_MAP = {
+    "hevc_nvenc": {
+        "ultrafast": "p1",
+        "fast": "p3",
+        "medium": "p5",
+        "slow": "p6",
+        "veryslow": "p7",
+    },
+    "hevc_qsv": {
+        "ultrafast": "veryfast",
+        "fast": "fast",
+        "medium": "medium",
+        "slow": "slow",
+        "veryslow": "veryslow",
+    },
+    "hevc_amf": {
+        "ultrafast": "speed",
+        "fast": "speed",
+        "medium": "balanced",
+        "slow": "quality",
+        "veryslow": "high_quality",
+    },
+}
 
 
 @dataclass(frozen=True)
@@ -39,7 +68,6 @@ class CompressOptions:
     preset: Optional[str]
     target_height: Optional[int]
     hw_encoder: Optional[str]
-    hw_quality_param: Optional[str]
     log_file: Path
 
 
@@ -82,7 +110,8 @@ def get_video_size(video_path):
     try:
         result = subprocess.run(
             [get_ffmpeg_command(), "-i", str(video_path), "-hide_banner"],
-            stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True,
+            stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
+            encoding="utf-8", errors="replace",
         )
     except Exception as e:
         logI(f"无法读取视频信息: {e}")
@@ -126,14 +155,14 @@ def output_name(stem, size, crf, suffix):
 
 
 def check_hardware_encoder(ffmpeg_cmd):
-    """返回首个可用的硬件编码器及其质量参数"""
+    """返回首个可用的硬件编码器"""
     try:
         encoders = subprocess.run(
             [ffmpeg_cmd, "-encoders"], stdout=subprocess.PIPE,
-            stderr=subprocess.DEVNULL, text=True,
+            stderr=subprocess.DEVNULL, encoding="utf-8", errors="replace",
         ).stdout
 
-        for encoder, quality_param in HARDWARE_ENCODERS:
+        for encoder in HARDWARE_ENCODERS:
             if encoder not in encoders:
                 continue
             # 编码器列在支持列表中不代表本机可用（如 Windows 上的 vaapi/nvenc），用空跑验证
@@ -143,37 +172,77 @@ def check_hardware_encoder(ffmpeg_cmd):
             if subprocess.run(test, stdout=subprocess.DEVNULL,
                               stderr=subprocess.DEVNULL).returncode != 0:
                 continue
-            return encoder, quality_param
+            return encoder
     except Exception as e:
         logI(f"检查硬件编码器失败: {e}")
 
-    return None, None
+    return None
 
 
-def quality_args(encoder, quality_param, crf):
-    """把 CRF 映射为各编码器的质量参数"""
+def quality_args(encoder, crf):
+    """把 CRF 映射为各编码器的质量参数
+
+    硬件编码器没有 -crf（那是 x264/x265 专属），但都有等效的恒定质量模式，
+    数值方向与 CRF 一致（越小越好），绝对画质不等价。
+    """
     if encoder == SOFTWARE_ENCODER:
         return ["-crf", str(crf)]
+    if encoder == "hevc_nvenc":
+        # -cq 只在 VBR 模式生效，需配合 -b:v 0 表示纯恒定质量
+        return ["-rc", "vbr", "-cq", str(crf), "-b:v", "0"]
+    if encoder == "hevc_qsv":
+        # ICQ 恒定质量模式，不能同时指定 -b:v
+        return ["-global_quality", str(crf)]
+    if encoder == "hevc_amf":
+        # AMF 的 QVBR 质量等级 1-51，越大画质越好（与 CRF 方向相反）
+        return ["-rc", "qvbr", "-qvbr_quality_level",
+                str(max(1, min(51, 51 - crf)))]
+    if encoder == "hevc_vaapi":
+        return ["-rc_mode", "CQP", "-qp", str(crf)]
     if encoder == "hevc_videotoolbox":
         # videotoolbox 的 -q:v 取值 0-100 且越大越好，与 CRF 方向相反
         return ["-q:v", str(max(1, min(100, round(100 - crf * 100 / 51))))]
+    return []
+
+
+def preset_args(encoder, preset):
+    """把通用预设名映射为编码器原生预设"""
+    preset = preset or DEFAULT_PRESET
+    if encoder == SOFTWARE_ENCODER:
+        return ["-preset", preset]
+    mapping = PRESET_MAP.get(encoder)
+    if not mapping:
+        return []  # vaapi / videotoolbox 无预设概念
+    return ["-preset", mapping.get(preset, mapping[DEFAULT_PRESET])]
+
+
+def tune_args(encoder, preset):
+    """各硬件编码器的画质调优参数"""
+    preset = preset or DEFAULT_PRESET
+    if encoder == "hevc_nvenc":
+        args = ["-tune", "hq", "-rc-lookahead", "32", "-spatial-aq", "1"]
+        if preset in ("slow", "veryslow"):
+            # 两遍运动估计；qres 兼容老卡，fullres 需要 Turing 及以上
+            args += ["-temporal-aq", "1", "-multipass", "qres"]
+        return args
     if encoder == "hevc_amf":
-        # AMF 没有 -qp 选项，需用 CQP 模式分别设置 I/P 帧 QP
-        return ["-rc", "cqp", "-qp_i", str(crf), "-qp_p", str(crf)]
-    return [quality_param, str(crf)]
+        return ["-usage", "transcoding"]
+    return []
 
 
-def build_command(ffmpeg_cmd, task, encoder, quality_param, size):
+def build_command(ffmpeg_cmd, task, encoder, size):
     """构建 ffmpeg 命令"""
     cmd = [ffmpeg_cmd, "-i", str(task.video), "-c:v", encoder, "-tag:v", "hvc1"]
-    # -preset 是 x265 的字符串预设，硬件编码器不适用（AMF 的 -preset 为整数）
-    if task.options.preset and encoder == SOFTWARE_ENCODER:
-        cmd.extend(["-preset", task.options.preset])
     if size:
         cmd.extend(["-vf", f"scale={size[0]}:{size[1]}"])
-    cmd.extend(quality_args(encoder, quality_param, task.options.crf))
-    if encoder == SOFTWARE_ENCODER:
-        cmd.extend(["-c:a", "aac", "-b:a", "128k"])
+    cmd.extend(preset_args(encoder, task.options.preset))
+    cmd.extend(tune_args(encoder, task.options.preset))
+    cmd.extend(quality_args(encoder, task.options.crf))
+    if encoder != SOFTWARE_ENCODER:
+        # 消费级 GPU 的 10bit 编码支持不一（AMD 上 10bit 源会让 encoder->Init() 失败），
+        # 硬件路径统一输出 8bit，由 ffmpeg 自动插入 10bit -> 8bit 转换
+        cmd.extend(["-pix_fmt", "yuv420p"])
+    cmd.extend(["-c:a", "aac", "-b:a", "128k"])
     cmd.append(str(task.temp_file))
     return cmd
 
@@ -182,7 +251,8 @@ def run_ffmpeg(cmd, temp_file):
     """执行 ffmpeg 并实时显示进度，返回 (是否成功, 错误信息)"""
     logI(f"执行命令: {' '.join(cmd)}")
     process = subprocess.Popen(cmd, stdout=subprocess.DEVNULL,
-                               stderr=subprocess.PIPE, text=True)
+                               stderr=subprocess.PIPE,
+                               encoding="utf-8", errors="replace")
 
     tail = []
     while True:
@@ -231,13 +301,13 @@ def process_video(task):
         task.temp_file.unlink()
 
     # 硬件编码失败时回退软件编码
-    attempts = [(options.hw_encoder, options.hw_quality_param)] if options.hw_encoder else []
-    attempts.append((SOFTWARE_ENCODER, None))
+    attempts = [options.hw_encoder] if options.hw_encoder else []
+    attempts.append(SOFTWARE_ENCODER)
 
     ffmpeg_cmd = get_ffmpeg_command()
     ok, error = False, "未知错误"
-    for encoder, quality_param in attempts:
-        cmd = build_command(ffmpeg_cmd, task, encoder, quality_param, size)
+    for encoder in attempts:
+        cmd = build_command(ffmpeg_cmd, task, encoder, size)
         ok, error = run_ffmpeg(cmd, task.temp_file)
         if ok:
             break
@@ -286,12 +356,22 @@ def process_file_list(files, options, workers=None):
     logI(f"开始处理 {len(tasks)} 个视频文件 | 使用 {processes} 个工作进程")
     start = time.time()
     failures = 0
+    total_original = 0
+    total_processed = 0
     with Pool(processes=processes) as pool:
         for status, stats in pool.imap_unordered(process_video, tasks):
             tracker.update(status, stats)
             if not status:
                 failures += 1
+            else:
+                total_original += stats.get("original_size", 0)
+                total_processed += stats.get("processed_size", 0)
     tracker.finish_all()
+    if total_original > 0:
+        saved = total_original - total_processed
+        logI(f"处理前总大小: {format_size(total_original)}")
+        logI(f"处理后总大小: {format_size(total_processed)}")
+        logI(f"共节省: {format_size(saved)} ({saved / total_original * 100:.1f}%)")
     logI(f"总耗时: {time.time() - start:.2f} 秒")
     return failures == 0
 
@@ -329,6 +409,14 @@ class VideoCompressor(MediaProcessor):
         return process_video(args)
 
 
+def _pause_before_exit():
+    """菜单调用时保持控制台窗口，避免结束后一闪而过"""
+    try:
+        input("\n处理结束，按回车键关闭窗口...")
+    except (EOFError, KeyboardInterrupt):
+        pass
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="Compress videos to H.265/HEVC (software encoding by default)")
@@ -340,12 +428,17 @@ def main():
                       help="目标高度，如 1080p / 720p，仅缩小不放大")
     parser.add_argument("--hw", action="store_true",
                       help="尝试硬件编码，失败自动回退软件编码")
-    parser.add_argument("-p", "--preset", type=str,
-                      help="FFmpeg preset (e.g. medium, slow, veryslow)")
+    parser.add_argument("-p", "--preset", choices=PRESET_CHOICES, default=None,
+                      help="编码速度/画质预设，硬件编码器自动映射为原生预设 (default: medium)")
     parser.add_argument("-w", "--workers", type=int,
                       help="Number of worker processes (default: CPU count + 1)")
+    parser.add_argument("--pause", action="store_true",
+                      help="处理结束后等待回车再退出（菜单调用时保持窗口不关闭）")
 
     args = parser.parse_args()
+
+    if args.pause:
+        atexit.register(_pause_before_exit)
 
     if not 0 <= args.crf <= 51:
         print(f"Error: CRF 必须在 0-51 之间 - {args.crf}")
@@ -371,14 +464,12 @@ def main():
     log_file = log_dir / "video_compress.log"
     setup_logging(log_file)
 
-    hw_encoder, hw_quality_param = (check_hardware_encoder(get_ffmpeg_command())
-                                    if args.hw else (None, None))
+    hw_encoder = check_hardware_encoder(get_ffmpeg_command()) if args.hw else None
     options = CompressOptions(
         crf=args.crf,
         preset=args.preset,
         target_height=args.resolution,
         hw_encoder=hw_encoder,
-        hw_quality_param=hw_quality_param,
         log_file=log_file,
     )
 
