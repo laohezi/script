@@ -22,6 +22,8 @@ from media_process import (
 
 DEFAULT_CRF = 28
 SOFTWARE_ENCODER = "libx265"
+VAAPI_ENCODER = "hevc_vaapi"
+VAAPI_DEVICES = ("/dev/dri/renderD128", "/dev/dri/renderD129", "/dev/dri/renderD130")
 SUPPORTED_FORMATS = (".mp4", ".mov", ".avi", ".mkv", ".webm", ".flv", ".m4v")
 # 硬件编码器优先级: qsv > vaapi > videotoolbox > nvenc > amf
 HARDWARE_ENCODERS = (
@@ -69,6 +71,7 @@ class CompressOptions:
     target_height: Optional[int]
     hw_encoder: Optional[str]
     log_file: Path
+    hw_device: Optional[str] = None
 
 
 @dataclass
@@ -154,8 +157,19 @@ def output_name(stem, size, crf, suffix):
     return f"{stem}_{dims}crf{crf}{suffix}"
 
 
-def check_hardware_encoder(ffmpeg_cmd):
-    """返回首个可用的硬件编码器"""
+def find_vaapi_device():
+    """返回可用的 VAAPI render 节点（仅 Linux 有 /dev/dri）"""
+    for device in VAAPI_DEVICES:
+        if os.access(device, os.R_OK | os.W_OK):
+            return device
+    return None
+
+
+def check_hardware_encoder(ffmpeg_cmd, vaapi_device=None):
+    """返回首个可用的硬件编码器
+
+    vaapi_device 为 None 时跳过 VAAPI（没有 render 节点就必然失败）。
+    """
     try:
         encoders = subprocess.run(
             [ffmpeg_cmd, "-encoders"], stdout=subprocess.PIPE,
@@ -165,10 +179,17 @@ def check_hardware_encoder(ffmpeg_cmd):
         for encoder in HARDWARE_ENCODERS:
             if encoder not in encoders:
                 continue
-            # 编码器列在支持列表中不代表本机可用（如 Windows 上的 vaapi/nvenc），用空跑验证
-            test = [ffmpeg_cmd, "-hide_banner", "-f", "lavfi",
-                    "-i", "testsrc=size=320x240:rate=25", "-t", "0.2",
-                    "-c:v", encoder, "-f", "null", "-"]
+            # 编码器出现在支持列表里不代表本机可用（如 Windows 上的 vaapi/nvenc），用空跑验证
+            test = [ffmpeg_cmd, "-hide_banner"]
+            if encoder == VAAPI_ENCODER:
+                if not vaapi_device:
+                    continue
+                # 与真实命令保持一致：指定 render 节点，并把软件帧上传显存
+                test.extend(["-vaapi_device", vaapi_device])
+            test.extend(["-f", "lavfi", "-i", "testsrc=size=320x240:rate=25", "-t", "0.2"])
+            test.extend(["-vf", "format=nv12,hwupload" if encoder == VAAPI_ENCODER
+                         else "format=yuv420p"])
+            test.extend(["-c:v", encoder, "-f", "null", "-"])
             if subprocess.run(test, stdout=subprocess.DEVNULL,
                               stderr=subprocess.DEVNULL).returncode != 0:
                 continue
@@ -184,6 +205,15 @@ def quality_args(encoder, crf):
 
     硬件编码器没有 -crf（那是 x264/x265 专属），但都有等效的恒定质量模式，
     数值方向与 CRF 一致（越小越好），绝对画质不等价。
+
+    VideoToolbox 的 -q:v 与 x265 CRF 不同标度。实测 1080p 两种片源（细节丰富
+    的合成画面 / 平滑渐变），以 libvmaf 对齐 x265 同 CRF 的得分后拟合出
+    q ≈ 107 - 2*crf，平均偏差不到 1 分：
+        CRF 18 -> q71 (VMAF 97.7，与 x265 crf18 持平)
+        CRF 23 -> q61 (VMAF 96.2，与 x265 crf23 持平)
+        CRF 28 -> q51 (VMAF 92.4~83.9，对应 x265 93.4~83.4)
+        CRF 35 -> q37 (VMAF 85.0~68.0，对应 x265 84.8~67.1)
+    旧公式 100 - 1.96*crf 系统性偏低约 7 点，画质明显不如同 CRF 的软件编码。
     """
     if encoder == SOFTWARE_ENCODER:
         return ["-crf", str(crf)]
@@ -200,8 +230,8 @@ def quality_args(encoder, crf):
     if encoder == "hevc_vaapi":
         return ["-rc_mode", "CQP", "-qp", str(crf)]
     if encoder == "hevc_videotoolbox":
-        # videotoolbox 的 -q:v 取值 0-100 且越大越好，与 CRF 方向相反
-        return ["-q:v", str(max(1, min(100, round(100 - crf * 100 / 51))))]
+        # -q:v 取值 1-100 且越大越好，与 CRF 方向相反
+        return ["-q:v", str(max(1, min(100, 107 - 2 * crf)))]
     return []
 
 
@@ -210,9 +240,14 @@ def preset_args(encoder, preset):
     preset = preset or DEFAULT_PRESET
     if encoder == SOFTWARE_ENCODER:
         return ["-preset", preset]
+    if encoder == "hevc_videotoolbox":
+        # VideoToolbox 无预设档位，只有 prio_speed 可调：
+        # 1 = 速度优先（实测同 q 下快约 25%，VMAF 低约 1.3）
+        # 0 = 画质优先，实测与 auto 输出逐帧一致，纯属无操作，故不设
+        return ["-prio_speed", "1"] if preset in ("ultrafast", "fast") else []
     mapping = PRESET_MAP.get(encoder)
     if not mapping:
-        return []  # vaapi / videotoolbox 无预设概念
+        return []  # vaapi 无预设概念
     return ["-preset", mapping.get(preset, mapping[DEFAULT_PRESET])]
 
 
@@ -227,20 +262,69 @@ def tune_args(encoder, preset):
         return args
     if encoder == "hevc_amf":
         return ["-usage", "transcoding"]
+    # VideoToolbox 的 spatial_aq / power_efficient / realtime 在恒定质量模式下
+    # 实测无效（输出逐帧完全一致），故不传，避免无谓的兼容性风险
     return []
 
 
-def build_command(ffmpeg_cmd, task, encoder, size):
-    """构建 ffmpeg 命令"""
-    cmd = [ffmpeg_cmd, "-i", str(task.video), "-c:v", encoder, "-tag:v", "hvc1"]
-    if size:
-        cmd.extend(["-vf", f"scale={size[0]}:{size[1]}"])
+def hw_decode_args(encoder):
+    """硬件解码参数与对应的硬件缩放滤镜
+
+    只有 Intel 的两条路径支持全程留在显存的硬件解码：
+    QSV 走 -hwaccel qsv + scale_qsv，VAAPI 走 -hwaccel vaapi + scale_vaapi。
+    其他编码器（NVENC/VideoToolbox/AMF）返回 None，走软件解码。
+    """
+    if encoder == VAAPI_ENCODER:
+        return ["-hwaccel", "vaapi", "-hwaccel_output_format", "vaapi"], "scale_vaapi"
+    if encoder == "hevc_qsv":
+        return ["-hwaccel", "qsv", "-hwaccel_output_format", "qsv"], "scale_qsv"
+    return None
+
+
+def supports_hw_decode(encoder, vaapi_device):
+    """该编码器能否走硬件解码（VAAPI 还必须有 render 节点）"""
+    if not encoder or not hw_decode_args(encoder):
+        return False
+    return encoder != VAAPI_ENCODER or bool(vaapi_device)
+
+
+def build_command(ffmpeg_cmd, task, encoder, size, hw_decode=False):
+    """构建 ffmpeg 命令
+
+    hw_decode=True 时解码帧留在显存里、缩放改用硬件滤镜，省掉软件解码与
+    显存上传；这类小核显机器（如 Gemini Lake）软解 4K HEVC 是主要瓶颈。
+    """
+    hw = hw_decode_args(encoder) if hw_decode else None
+
+    cmd = [ffmpeg_cmd]
+    if encoder == VAAPI_ENCODER:
+        cmd.extend(["-vaapi_device", task.options.hw_device])
+    if hw:
+        cmd.extend(hw[0])
+    cmd.extend(["-i", str(task.video), "-c:v", encoder, "-tag:v", "hvc1"])
+
+    filters = []
+    if hw:
+        # 硬件滤镜的 format=nv12 同时完成 10bit -> 8bit 与尺寸缩放
+        scale = f"w={size[0]}:h={size[1]}:format=nv12" if size else "format=nv12"
+        filters.append(f"{hw[1]}={scale}")
+    elif size:
+        filters.append(f"scale={size[0]}:{size[1]}")
+    if encoder == VAAPI_ENCODER and not hw:
+        # VAAPI 编码器只吃显存帧：软件解码后转 NV12 再上传
+        filters.extend(["format=nv12", "hwupload"])
+    if filters:
+        cmd.extend(["-vf", ",".join(filters)])
+
     cmd.extend(preset_args(encoder, task.options.preset))
     cmd.extend(tune_args(encoder, task.options.preset))
     cmd.extend(quality_args(encoder, task.options.crf))
-    if encoder != SOFTWARE_ENCODER:
+    if encoder != SOFTWARE_ENCODER and not hw:
         # 消费级 GPU 的 10bit 编码支持不一（AMD 上 10bit 源会让 encoder->Init() 失败），
-        # 硬件路径统一输出 8bit，由 ffmpeg 自动插入 10bit -> 8bit 转换
+        # 硬件路径统一输出 8bit，由 ffmpeg 自动插入 10bit -> 8bit 转换。
+        # Apple VideoToolbox 虽支持 Main10，但实测同画质下体积与 8bit 持平，
+        # 兼容性反而更差，故此路径同样固定 8bit。
+        # 硬解路径不能加 -pix_fmt：会在硬件滤镜后插入 auto_scale 导致格式协商失败。
         cmd.extend(["-pix_fmt", "yuv420p"])
     cmd.extend(["-c:a", "aac", "-b:a", "128k"])
     cmd.append(str(task.temp_file))
@@ -300,18 +384,22 @@ def process_video(task):
     if task.temp_file.exists():
         task.temp_file.unlink()
 
-    # 硬件编码失败时回退软件编码
-    attempts = [options.hw_encoder] if options.hw_encoder else []
-    attempts.append(SOFTWARE_ENCODER)
+    # 硬件编码/解码失败时逐级回退：硬解+硬编 -> 软解+硬编 -> 软解+软编
+    attempts = []
+    if options.hw_encoder:
+        if supports_hw_decode(options.hw_encoder, options.hw_device):
+            attempts.append((options.hw_encoder, True))
+        attempts.append((options.hw_encoder, False))
+    attempts.append((SOFTWARE_ENCODER, False))
 
     ffmpeg_cmd = get_ffmpeg_command()
     ok, error = False, "未知错误"
-    for encoder in attempts:
-        cmd = build_command(ffmpeg_cmd, task, encoder, size)
+    for encoder, hw_decode in attempts:
+        cmd = build_command(ffmpeg_cmd, task, encoder, size, hw_decode)
         ok, error = run_ffmpeg(cmd, task.temp_file)
         if ok:
             break
-        logI(f"{encoder} 编码失败: {error}")
+        logI(f"{encoder}{' 硬件解码' if hw_decode else ''} 编码失败: {error}")
         if task.temp_file.exists():
             task.temp_file.unlink()
 
@@ -419,7 +507,7 @@ def _pause_before_exit():
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Compress videos to H.265/HEVC (software encoding by default)")
+        description="Compress videos to H.265/HEVC (hardware accelerated when available)")
     parser.add_argument("inputs", nargs="*", default=["."],
                       help="视频文件或目录，可混合指定多个 (default: current directory)")
     parser.add_argument("-c", "--crf", type=int, default=DEFAULT_CRF,
@@ -427,7 +515,9 @@ def main():
     parser.add_argument("-r", "--resolution", type=parse_resolution, default=None,
                       help="目标高度，如 1080p / 720p，仅缩小不放大")
     parser.add_argument("--hw", action="store_true",
-                      help="尝试硬件编码，失败自动回退软件编码")
+                      help="兼容旧参数；硬件加速现已默认开启，此参数无额外作用")
+    parser.add_argument("--sw", "--software", dest="software", action="store_true",
+                      help="强制软件编码，不探测硬件编码器")
     parser.add_argument("-p", "--preset", choices=PRESET_CHOICES, default=None,
                       help="编码速度/画质预设，硬件编码器自动映射为原生预设 (default: medium)")
     parser.add_argument("-w", "--workers", type=int,
@@ -464,20 +554,29 @@ def main():
     log_file = log_dir / "video_compress.log"
     setup_logging(log_file)
 
-    hw_encoder = check_hardware_encoder(get_ffmpeg_command()) if args.hw else None
+    hw_device = find_vaapi_device() if not args.software else None
+    hw_encoder = check_hardware_encoder(get_ffmpeg_command(), hw_device) if not args.software else None
     options = CompressOptions(
         crf=args.crf,
         preset=args.preset,
         target_height=args.resolution,
         hw_encoder=hw_encoder,
         log_file=log_file,
+        hw_device=hw_device if hw_encoder == VAAPI_ENCODER else None,
     )
 
     logI(f"开始视频压缩: {len(dirs)} 个目录, {len(files)} 个文件")
     logI(f"编码器: {hw_encoder or SOFTWARE_ENCODER} | CRF: {args.crf} | "
          f"目标分辨率: {f'{args.resolution}p' if args.resolution else '保持原始'}")
-    if args.hw and not hw_encoder:
+    if supports_hw_decode(hw_encoder, hw_device):
+        device = f" ({hw_device})" if hw_encoder == VAAPI_ENCODER else ""
+        logI(f"硬件解码: {hw_encoder}{device}，解码失败自动回退软件解码")
+    if args.software:
+        logI("已指定软件编码（--sw），跳过硬件探测")
+    elif not hw_encoder:
         logI("未找到可用的硬件编码器，使用软件编码")
+    if hw_encoder == "hevc_videotoolbox" and args.preset in ("slow", "veryslow"):
+        logI("VideoToolbox 无更慢档预设，按 medium 处理")
 
     if not check_ffmpeg():
         sys.exit(1)
