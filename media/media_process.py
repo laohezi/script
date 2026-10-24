@@ -160,10 +160,12 @@ class GlobalProgressTracker(ProgressTracker):
 class DirectoryProcessor:
     """处理目录和文件收集的类"""
     
-    def __init__(self, input_base_dir, output_suffix=compressed_identifier):
+    def __init__(self, input_base_dir, output_suffix=compressed_identifier, output_base_dir=None):
         self.input_base_dir = Path(input_base_dir).absolute()
-        self.output_base_dir = Path(f"{self.input_base_dir}{output_suffix}")
-        self.output_base_dir.mkdir(exist_ok=True)
+        # 显式指定输出根目录优先（如输出到 <输入父目录>/compress），否则用 <输入目录>_compressed
+        self.output_base_dir = (Path(output_base_dir).absolute() if output_base_dir
+                                else Path(f"{self.input_base_dir}{output_suffix}"))
+        self.output_base_dir.mkdir(parents=True, exist_ok=True)
         # 添加需要跳过的文件夹和文件模式
         self.skip_dir_patterns = ["@*", ".*"]  # 跳过@开头和.开头的文件夹
         self.skip_file_patterns = [".*"]  # 跳过.开头的文件
@@ -253,10 +255,10 @@ class DirectoryProcessor:
 class MediaProcessor:
     """多媒体处理器基类"""
     
-    def __init__(self, input_dir, workers=None,output_suffix=compressed_identifier):
+    def __init__(self, input_dir, workers=None, output_suffix=compressed_identifier, output_base_dir=None):
         self.input_dir = input_dir
         self.workers = workers if workers else max(3, os.cpu_count()+1)
-        self.directory_processor = DirectoryProcessor(input_dir, output_suffix)
+        self.directory_processor = DirectoryProcessor(input_dir, output_suffix, output_base_dir)
         self.supported_formats = ()  # 子类应覆盖此属性
     
     def _process_directory(self, input_dir):

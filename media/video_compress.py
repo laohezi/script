@@ -22,6 +22,7 @@ from media_process import (
 
 DEFAULT_CRF = 28
 SOFTWARE_ENCODER = "libx265"
+OUTPUT_DIR_NAME = "compress"
 VAAPI_ENCODER = "hevc_vaapi"
 VAAPI_DEVICES = ("/dev/dri/renderD128", "/dev/dri/renderD129", "/dev/dri/renderD130")
 SUPPORTED_FORMATS = (".mp4", ".mov", ".avi", ".mkv", ".webm", ".flv", ".m4v")
@@ -419,16 +420,24 @@ def process_video(task):
     return True, {"message": f"{stats['formatted_text']}{suffix}", **stats}
 
 
+def output_dir_for(path):
+    """压缩结果统一放到输入同级的 compress 目录，输入已在其中时原地输出"""
+    parent = Path(path).absolute().parent
+    return parent if parent.name == OUTPUT_DIR_NAME else parent / OUTPUT_DIR_NAME
+
+
 def create_file_tasks(files, options):
-    """单文件模式：输出到源文件同目录，文件名带输出尺寸与 CRF"""
+    """单文件模式：输出到源文件同级的 compress 目录，文件名带输出尺寸与 CRF"""
     tasks = []
     for video in files:
         source_size = get_video_size(video)
         size = compute_target_size(source_size, options.target_height) or source_size
+        output_dir = output_dir_for(video)
+        output_dir.mkdir(parents=True, exist_ok=True)
         tasks.append(VideoTask(
             video=video,
-            output_path=video.parent / output_name(video.stem, size, options.crf, video.suffix),
-            temp_file=video.parent / f".{video.stem}.tmp{video.suffix}",
+            output_path=output_dir / output_name(video.stem, size, options.crf, video.suffix),
+            temp_file=output_dir / f".{video.stem}.tmp{video.suffix}",
             options=options,
         ))
     return tasks
@@ -465,10 +474,17 @@ def process_file_list(files, options, workers=None):
 
 
 class VideoCompressor(MediaProcessor):
-    """视频压缩器：默认软件编码 H.265，可选硬件编码"""
+    """视频压缩器：默认硬件加速，压缩结果写入输入目录下的 compress 子目录"""
 
     def __init__(self, input_dir, options, workers=None):
-        super().__init__(input_dir, workers)
+        input_path = Path(input_dir).absolute()
+        # 输出目录与输入目录同级下再开 compress，输入本身已是 compress 时原地输出
+        output_base_dir = (input_path if input_path.name == OUTPUT_DIR_NAME
+                           else input_path / OUTPUT_DIR_NAME)
+        super().__init__(input_path, workers, output_base_dir=output_base_dir)
+        if output_base_dir != input_path:
+            # 已压缩产物不再参与扫描，避免重复压缩
+            self.directory_processor.skip_dir_patterns.append(OUTPUT_DIR_NAME)
         self.options = options
         self.supported_formats = SUPPORTED_FORMATS
 
