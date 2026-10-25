@@ -432,7 +432,7 @@ def create_file_tasks(files, options):
     tasks = []
     for video in files:
         source_size = get_video_size(video)
-        size = compute_target_size(source_size, options.target_height) or source_size
+        size = compute_target_size(source_size, options.target_height)
         output_dir = output_dir_for(video)
         output_dir.mkdir(parents=True, exist_ok=True)
         tasks.append(VideoTask(
@@ -494,16 +494,18 @@ class VideoCompressor(MediaProcessor):
         return check_ffmpeg()
 
     def create_tasks(self, files):
-        """目录模式：输出目录镜像输入目录结构，文件名保持不变"""
+        """目录模式：输出目录镜像输入目录结构，文件名追加 CRF（缩小时再带尺寸）"""
         input_base_dir = self.directory_processor.input_base_dir
         output_base_dir = self.directory_processor.output_base_dir
         tasks = []
         for video in files:
             output_dir = output_base_dir / video.relative_to(input_base_dir).parent
             output_dir.mkdir(parents=True, exist_ok=True)
+            size = compute_target_size(get_video_size(video), self.options.target_height)
+            name = output_name(video.stem, size, self.options.crf, video.suffix)
             tasks.append(VideoTask(
                 video=video,
-                output_path=output_dir / video.name,
+                output_path=output_dir / name,
                 temp_file=output_dir / f".{video.stem}.tmp{video.suffix}",
                 options=self.options,
             ))
