@@ -358,11 +358,12 @@ def run_ffmpeg(cmd, temp_file):
 
 
 def keep_original(video, output_path):
-    """编码无收益时用硬链接保留原文件（跨设备时退化为复制）"""
-    try:
-        os.link(video, output_path)
-    except OSError:
-        shutil.copy2(video, output_path)
+    """编码无收益时复制一份原文件
+
+    不复用硬链接：硬链接与源文件共用 inode，删除源文件后空间不会释放，
+    且任何原地写入都会同时改到副本。
+    """
+    shutil.copy2(video, output_path)
 
 
 def process_video(task):
@@ -409,7 +410,7 @@ def process_video(task):
 
     kept_original = task.temp_file.stat().st_size >= video.stat().st_size
     if kept_original:
-        logI("编码后体积未减小，保留原文件")
+        logI("编码后体积未减小，复制原文件到输出目录")
         task.temp_file.unlink()
         keep_original(video, task.output_path)
     else:
