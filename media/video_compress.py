@@ -7,6 +7,7 @@ import re
 import shutil
 import subprocess
 import sys
+import tempfile
 import time
 from dataclasses import dataclass
 from multiprocessing import Pool
@@ -538,6 +539,18 @@ def _pause_before_exit():
         pass
 
 
+def resolve_log_file(path):
+    """返回可写的日志路径；FUSE/FTP 等挂载点不支持追加写时回退到本地临时目录"""
+    try:
+        with open(path, "a", encoding="utf-8"):
+            pass
+        return path
+    except OSError as e:
+        fallback = Path(tempfile.gettempdir()) / f"video_compress_{os.getpid()}.log"
+        print(f"警告: 无法在 {path} 写日志（{e.strerror}），改用 {fallback}")
+        return fallback
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="Compress videos to H.265/HEVC (hardware accelerated when available)")
@@ -584,7 +597,7 @@ def main():
 
     # 设置日志记录
     log_dir = inputs[0] if inputs[0].is_dir() else inputs[0].parent
-    log_file = log_dir / "video_compress.log"
+    log_file = resolve_log_file(log_dir / "video_compress.log")
     setup_logging(log_file)
 
     hw_device = find_vaapi_device() if not args.software else None
