@@ -22,7 +22,9 @@ from media_process import (
 
 DEFAULT_CRF = 28
 SOFTWARE_ENCODER = "libx265"
-OUTPUT_DIR_NAME = "compress"
+# 输出目录：compress_crf<CRF>，不同参数互不覆盖；历史 compress 目录也会被跳过
+OUTPUT_DIR_PREFIX = "compress"
+_OUTPUT_DIR_RE = re.compile(rf"^{OUTPUT_DIR_PREFIX}(_crf\d+)?$")
 VAAPI_ENCODER = "hevc_vaapi"
 VAAPI_DEVICES = ("/dev/dri/renderD128", "/dev/dri/renderD129", "/dev/dri/renderD130")
 SUPPORTED_FORMATS = (".mp4", ".mov", ".avi", ".mkv", ".webm", ".flv", ".m4v")
@@ -421,19 +423,29 @@ def process_video(task):
     return True, {"message": f"{stats['formatted_text']}{suffix}", **stats}
 
 
-def output_dir_for(path):
-    """压缩结果统一放到输入同级的 compress 目录，输入已在其中时原地输出"""
+def output_dir_name(crf):
+    """输出目录名带上 CRF，避免不同参数互相覆盖"""
+    return f"{OUTPUT_DIR_PREFIX}_crf{crf}"
+
+
+def is_output_dir(name):
+    """判断目录名是否为压缩输出目录（compress 或 compress_crf<N>）"""
+    return bool(_OUTPUT_DIR_RE.fullmatch(name))
+
+
+def output_dir_for(path, crf):
+    """压缩结果放到输入同级的 compress_crf<N> 目录，输入已在输出目录时原地输出"""
     parent = Path(path).absolute().parent
-    return parent if parent.name == OUTPUT_DIR_NAME else parent / OUTPUT_DIR_NAME
+    return parent if is_output_dir(parent.name) else parent / output_dir_name(crf)
 
 
 def create_file_tasks(files, options):
-    """单文件模式：输出到源文件同级的 compress 目录，文件名带输出尺寸与 CRF"""
+    """单文件模式：输出到源文件同级的 compress_crf<N> 目录，文件名带输出尺寸与 CRF"""
     tasks = []
     for video in files:
         source_size = get_video_size(video)
         size = compute_target_size(source_size, options.target_height)
-        output_dir = output_dir_for(video)
+        output_dir = output_dir_for(video, options.crf)
         output_dir.mkdir(parents=True, exist_ok=True)
         tasks.append(VideoTask(
             video=video,
@@ -475,17 +487,19 @@ def process_file_list(files, options, workers=None):
 
 
 class VideoCompressor(MediaProcessor):
-    """视频压缩器：默认硬件加速，压缩结果写入输入目录下的 compress 子目录"""
+    """视频压缩器：默认硬件加速，压缩结果写入输入目录下的 compress_crf<N> 子目录"""
 
     def __init__(self, input_dir, options, workers=None):
         input_path = Path(input_dir).absolute()
-        # 输出目录与输入目录同级下再开 compress，输入本身已是 compress 时原地输出
-        output_base_dir = (input_path if input_path.name == OUTPUT_DIR_NAME
-                           else input_path / OUTPUT_DIR_NAME)
+        # 输入本身已是输出目录时原地输出，否则在输入下新建 compress_crf<N>
+        output_base_dir = (input_path if is_output_dir(input_path.name)
+                           else input_path / output_dir_name(options.crf))
         super().__init__(input_path, workers, output_base_dir=output_base_dir)
         if output_base_dir != input_path:
-            # 已压缩产物不再参与扫描，避免重复压缩
-            self.directory_processor.skip_dir_patterns.append(OUTPUT_DIR_NAME)
+            # 任何历史输出目录都不参与扫描，避免把已压缩产物再压一遍
+            self.directory_processor.skip_dir_patterns.extend(
+                [OUTPUT_DIR_PREFIX, f"{OUTPUT_DIR_PREFIX}_crf*"]
+            )
         self.options = options
         self.supported_formats = SUPPORTED_FORMATS
 
